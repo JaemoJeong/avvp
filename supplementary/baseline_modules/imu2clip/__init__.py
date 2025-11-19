@@ -1,0 +1,1 @@
+from .module import IMU2CLIPLightningModule
