@@ -49,7 +49,7 @@ class TemporalBlock(nn.Module):
         return x
 
 
-class SensorMotionEncoder(nn.Module):
+class SensorTemporalEncoder(nn.Module):
     def __init__(self, sensor_channels, size_embeddings=128, base_dim=32):
         super().__init__()
 
@@ -125,7 +125,7 @@ class Block(torch.nn.Module):
         return self.net(batch)
     
 
-class SensorAppearanceEncoder(nn.Module):
+class SensorSpatialEncoder(nn.Module):
     def __init__(self, sensor_channels, input_dim=32, size_embeddings: int = 128):
         super().__init__()
         self.block1 = Block(sensor_channels, input_dim, 5)
@@ -155,10 +155,10 @@ class SensorAppearanceEncoder(nn.Module):
         return {"ssl": ssl_out, "mmcl": mmcl_out, "emb": emb}
     
 class SensorModel(nn.Module):
-    def __init__(self, sensor_appearance_encoder, sensor_motion_encoder, clustering_module):
+    def __init__(self, sensor__encoder, sensor_temporal_encoder, clustering_module):
         super().__init__()
-        self.sensor_appearance_encoder = sensor_appearance_encoder
-        self.sensor_motion_encoder = sensor_motion_encoder
+        self.sensor__encoder = sensor__encoder
+        self.sensor_temporal_encoder = sensor_temporal_encoder
         self.clustering_module = clustering_module
         self.norm = nn.LayerNorm(256*2)
 
@@ -173,35 +173,20 @@ class SensorModel(nn.Module):
         z_sensor_online = torch.cat((s_app_norm, s_mot_norm), dim=1)
         return z_sensor_online
 
-    def encoding_appearance(self, batch, labels, return_features, idx):
-        # appearance embedding with clustering module
-        scores, features, pure_features = self.clustering_module(batch, labels=labels, return_features=return_features, idx=idx)
+    def encoding_(self, batch, return_features):
+        #  embedding with clustering module
+        scores, features, pure_features = self.clustering_module(batch, return_features=return_features)
         return scores, features, pure_features
 
     
     def encoding_motion(self, batch):
         # motion embedding
-        mot_emb = self.sensor_motion_encoder(batch)
+        mot_emb = self.sensor_temporal_encoder(batch)
         return mot_emb
 
 
 
 #############################################################
-
-# ---------------------------------------------------------------------
-# Attention Head (Object Encoder saliency map)
-# ---------------------------------------------------------------------
-class AttentionHead(nn.Module):
-    """Salient region 강조용 간단한 2D attention head."""
-    def __init__(self, in_channels):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        # x: [B, C, H, W]
-        return self.sigmoid(self.conv(x))  # [B, 1, H, W]
-
 
 # ---------------------------------------------------------------------
 # Shared CNN Encoder (Scene/Object 공통)
@@ -231,13 +216,7 @@ class SharedEncoder(nn.Module):
     def forward(self, x):
         return self.net(x)  # [B, out_dim, H', W']
 
-class MotionEncoder(nn.Module):
-    """
-    Motion Encoder with cosine-consistent projection.
-    강조점:
-      - CosineProj: norm-invariant projection layer
-      - optional cosine regularization for self-consistency
-    """
+class VideoTemporalEncoder(nn.Module):
     def __init__(self, in_channels=5, base_dim=32, latent_dim=256, use_cosine_proj=True):
         super().__init__()
         self.in_channels = in_channels
@@ -258,7 +237,6 @@ class MotionEncoder(nn.Module):
 
         self.spatial_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
 
-        # ✅ projection head 변경
         if use_cosine_proj:
             self.proj = CosineProj(latent_dim, latent_dim)
         else:
@@ -285,13 +263,13 @@ class MotionEncoder(nn.Module):
 
         if feat.shape[2] > 1:
             motion_diff = feat[:, :, 1:] - feat[:, :, :-1]
-            v_motion = motion_diff.mean(dim=2)
+            v_temporal = motion_diff.mean(dim=2)
         else:
-            v_motion = feat.mean(dim=2)
+            v_temporal = feat.mean(dim=2)
 
         # projection
-        v_motion = self.proj(v_motion)
-        return v_motion
+        v_temporal = self.proj(v_temporal)
+        return v_temporal
 
 
 # --- Cosine Projection Layer ---
@@ -306,75 +284,34 @@ class CosineProj(nn.Module):
         x = F.normalize(x, dim=1)
         return F.linear(x, w)
 
-
-
-
-# ---------------------------------------------------------------------
-# Scene Encoder (Global context)
-# ---------------------------------------------------------------------
-class SceneEncoder(nn.Module):
-    """Global/static appearance representation."""
+class VideoSpatialEncoder(nn.Module):
+    """Global/static  representation."""
     def __init__(self, in_dim=256, latent_dim=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_dim, latent_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(latent_dim),
+            nn.Conv2d(in_dim, latent_dim *2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(latent_dim *2),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1)
         )
 
     def forward(self, x):
-        # [B, C, H, W] → [B, latent_dim]
+        # [B, C, H, W] → [B, latent_dim *2]
         return self.net(x).flatten(1)
-
-
-# ---------------------------------------------------------------------
-# Object Encoder (Local salient appearance)
-# ---------------------------------------------------------------------
-class ObjectEncoder(nn.Module):
-    """Foreground/local salient representation."""
-    def __init__(self, in_dim=256, latent_dim=256):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_dim, latent_dim, kernel_size=3, padding=1),
-            nn.BatchNorm2d(latent_dim),
-            nn.ReLU(inplace=True)
-        )
-        self.attn = AttentionHead(latent_dim)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-    def forward(self, x):
-        feat = self.conv(x)                 # [B, latent_dim, H, W]
-        attn = self.attn(feat)              # [B, 1, H, W]
-        obj_feat = self.pool(feat * attn).flatten(1)
-        return obj_feat
     
-    
-# ---------------------------------------------------------------------
-# VisionModel (Simplified Appearance Encoder + Motion Encoder)
-# ---------------------------------------------------------------------
 class VisionModel(nn.Module):
-    """
-    Simplified MOSO: directly extract v_appearance from shared encoder.
-    Keeps MotionEncoder for Stage2 alignment.
-    """
     def __init__(self, in_channels=3, base_dim=64, latent_dim=256):
         super().__init__()
         # shared encoder (2D feature extractor)
         self.shared_encoder = SharedEncoder(in_channels, base_dim, out_dim=latent_dim)
-        self.scene_encoder = SceneEncoder(in_dim=latent_dim, latent_dim=latent_dim)
-        self.object_encoder = ObjectEncoder(in_dim=latent_dim, latent_dim=latent_dim)
-
-        # Scene + Object 결합 projection
-        self.proj = nn.Linear(latent_dim * 2, latent_dim)
-        self.norm = nn.LayerNorm(latent_dim*2)
+        
+        self.spatial_encoder = VideoSpatialEncoder(in_dim=latent_dim, latent_dim=latent_dim)
         self.fuse = nn.Sequential(
             nn.Linear(latent_dim * 2, latent_dim),
             nn.LayerNorm(latent_dim)
         )
 
-        # motion encoder for stage2
-        self.motion_encoder = MotionEncoder(
+        self.temporal_encoder = VideoTemporalEncoder(
             in_channels=in_channels+2 ,  # RGB + optical flow
             base_dim=base_dim // 2,
             latent_dim=latent_dim
@@ -384,12 +321,11 @@ class VisionModel(nn.Module):
         """
         video: [B, T, C, H, W]
         flows: [B, T, 2, H, W]
-        returns: dict with v_appearance, v_motion, z_video_online, vis_v
+        returns: dict with v_, v_temporal, z_video_online, vis_v
         """
 
         B, T, C, H, W = video.shape
 
-        # 1️⃣ Shared appearance features
         video_flat = video.view(B * T, C, H, W)
         shared_feat = self.shared_encoder(video_flat)   # [B*T, D, Hf, Wf]
         _, D, Hf, Wf = shared_feat.shape
@@ -397,28 +333,20 @@ class VisionModel(nn.Module):
         # temporal average pooling
         shared_feat = shared_feat.view(B, T, D, Hf, Wf).mean(dim=1)
 
-        v_scene = self.scene_encoder(shared_feat)
-        v_object = self.object_encoder(shared_feat)
+        v_scene = self.spatial_encoder(shared_feat)
+        v_spatial = self.fuse(v_scene)
+        v_temporal = self.temporal_encoder(videos = video, flows=flows)
 
-        fused = torch.cat([v_scene, v_object], dim=1)
-        v_appearance = self.fuse(fused)
-
-        # 3️⃣ motion feature extraction
-        video_centered = video - video.mean(dim=[3, 4], keepdim=True)
-        video_centered = video_centered / (video_centered.std(dim=[3, 4], keepdim=True) + 1e-6)
-        v_motion = self.motion_encoder(videos = video, flows=flows)
-
-        # detach appearance for z_video_online
-        v_app_norm = F.normalize(v_appearance, dim=1)
-        v_mot_norm = F.normalize(v_motion, dim=1)
+        # detach for z_video_online
+        v_spatial_norm = F.normalize(v_spatial, dim=1)
+        v_temporal_norm = F.normalize(v_temporal, dim=1)
         with torch.no_grad():
-            v_app_norm = v_app_norm.detach()
-        z_video_online = torch.cat([v_app_norm, v_mot_norm], dim=1) # motion var 균형을 위해 스케일링 반영
+            v_spatial_norm = v_spatial_norm.detach()
+        z_video_online = torch.cat([v_spatial_norm, v_temporal_norm], dim=1) # motion var 균형을 위해 스케일링 반영
 
         return {
-            "v_appearance": v_appearance,
-            "v_motion": v_motion,
-            "vis_v": video_centered - video.mean(dim=1, keepdim=True),
+            "v_spatial": v_spatial,
+            "v_temporal": v_temporal,
             "z_video_online": z_video_online,
         }
 
@@ -698,7 +626,7 @@ class ClusteringManager(nn.Module):
 
             self.cluster_stats = cluster_stats
         else:
-            print("⚠️ Warning: feature_bank or centroids not found — cluster stats skipped.")
+            print("Warning: feature_bank or centroids not found — cluster stats skipped.")
 
         weights = 1.0 / torch.pow(normalized_sizes, self.class_weight_power)
 
@@ -787,8 +715,7 @@ class ClusteringModule(nn.Module):
             except Exception as e:
                 print(f"[{rank}] Cache load failed ({e}). Proceeding with feature extraction.")
                 if os.path.exists(prototype_cache_path): os.remove(prototype_cache_path)
-                pass # 실패 시, 아래의 K-Means 로직으로 진행
-
+                pass 
         cache_hit_tensor = torch.tensor([cache_hit], dtype=torch.bool, device=device)
         if world_size > 1:
              dist.broadcast(cache_hit_tensor, src=0)
@@ -808,8 +735,8 @@ class ClusteringModule(nn.Module):
                 
                 _, features, _ = self(sensors, return_features=True)
                 
-                local_features.append(features) # GPU 상태로 유지
-                local_idx.append(idx) # GPU 상태로 유지
+                local_features.append(features)
+                local_idx.append(idx)
                 print(f"[{rank}] Processed batch {i+1}/{len(self.train_dataloader)}")
             
             local_features_tensor = torch.cat(local_features, dim=0)
@@ -825,9 +752,9 @@ class ClusteringModule(nn.Module):
                 
                 num_total_samples = len(self.train_dataloader.dataset)
                 feature_bank_temp = torch.empty(num_total_samples, self.clustering_manager.feature_dim, device="cuda")
-                feature_bank_temp[all_idx_cpu, ...] = all_features_gpu # ID를 사용한 최종 재배치
+                feature_bank_temp[all_idx_cpu, ...] = all_features_gpu
                 
-                self.clustering_manager.feature_bank = feature_bank_temp # CPU Feature Bank 할당
+                self.clustering_manager.feature_bank = feature_bank_temp
                     
                 all_features_cpu_numpy = self.clustering_manager.feature_bank.cpu().numpy()
                 kmeans = self.clustering_manager.kmeans.fit(all_features_cpu_numpy)
@@ -862,14 +789,11 @@ class ClusteringModule(nn.Module):
         self.train()
         return self.clustering_manager.centroids.clone()
 
-    def forward(self, x, idx=None, labels=None, return_features=False, step="train"):
+    def forward(self, x, return_features=False, step="train"):
         features = self.encoder(x)["emb"]
         if step == "train" or step == "val":
 
-            representative_feature = self.get_representative_sensor_feature(x, labels, num_total_sensors=END_INDEX-START_INDEX+1, top_k=self.top_k, id=idx)
-            if labels is not None:
-                for i in range(len(labels)):
-                    ranges = representative_feature
+            representative_feature = self.get_representative_sensor_feature(x)
             representative_feature = self.projection_layer(representative_feature)
             features = features + representative_feature
             
@@ -887,7 +811,7 @@ class ClusteringModule(nn.Module):
         pseudo_labels = self.clustering_manager.label_bank[sids_tensor]
         return pseudo_labels
     
-    def get_representative_sensor_feature(self, imu_batch, labels, num_total_sensors=97, top_k=1, id=None):
+    def get_representative_sensor_feature(self, imu_batch):
         ranges = torch.quantile(torch.abs(imu_batch), q=0.99, dim=2)
         return ranges
     

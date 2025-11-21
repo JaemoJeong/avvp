@@ -7,7 +7,7 @@ from method_utils import gather
 import copy
 
 # --- user define modules ---
-from model import SensorAppearanceEncoder, SensorMotionEncoder, SensorModel, VisionModel, ClusteringModule
+from model import SensorSpatialEncoder, SensorTemporalEncoder, SensorModel, VisionModel, ClusteringModule
 
 ####################################################################
 
@@ -20,10 +20,10 @@ class MethodLightningModule(pl.LightningModule):
         self.save_hyperparameters(args)
 
         self.video_model = VisionModel(latent_dim=self.hparams.embedding_dim)
-        self.sensor_appearance_encoder= SensorAppearanceEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
-        self.sensor_motion_encoder = SensorMotionEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
+        self.sensor_spatial_encoder= SensorSpatialEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
+        self.sensor_temporal_encoder = SensorTemporalEncoder(sensor_channels=self.hparams.num_sensors, size_embeddings=self.hparams.embedding_dim)
         self.clustering_module = ClusteringModule(
-            encoder=self.sensor_appearance_encoder,
+            encoder=self.sensor_spatial_encoder,
             embedding_dim=self.hparams.embedding_dim,   
             num_sensors=self.hparams.num_sensors,
             num_clusters=self.hparams.num_classes,
@@ -34,11 +34,9 @@ class MethodLightningModule(pl.LightningModule):
             min_cluster_size=self.hparams.min_cluster_size,
             mid_label=self.hparams.mid_label
         )
-        self.sensor_model = SensorModel(self.sensor_appearance_encoder, self.sensor_motion_encoder, self.clustering_module)
-        self.appearance_classifier = nn.Linear(256, self.hparams.num_classes) 
+        self.sensor_model = SensorModel(self.sensor_spatial_encoder, self.sensor_temporal_encoder, self.clustering_module)
+        self.spatial_classifier = nn.Linear(256, self.hparams.num_classes) 
     
-        self.mean = [0.48145466, 0.4578275, 0.40821073]
-        self.std = [0.26862954, 0.26130258, 0.27577711]
         self.video_classifier = nn.Linear(self.hparams.embedding_dim, self.hparams.num_classes)
         print(self.global_rank, "Model initialized.")
         self.epoch = 0        
@@ -67,22 +65,22 @@ class MethodLightningModule(pl.LightningModule):
 
     def enable_stage2(self):
         for n, p in self.video_model.named_parameters():
-            if any(key in n for key in ["shared_encoder", "scene", "object", "fuse", "appearance", "video_classifier"]):
+            if any(key in n for key in ["shared_encoder", "scene", "object", "fuse", "spatial", "video_classifier"]):
                 p.requires_grad = False
         
         for n, p in self.sensor_model.named_parameters():
-            if any(key in n for key in ["appearance"]):
+            if any(key in n for key in ["spatial"]):
                 p.requires_grad = False
 
         for n, p in self.video_model.named_parameters():
-            if "motion_encoder" in n:
+            if "temporal_encoder" in n:
                 p.requires_grad = True
-                print("video motion encoder trainable")
+                print("video temporal encoder trainable")
         
         for n, p in self.sensor_model.named_parameters():
-            if "motion_encoder" in n:
+            if "temporal_encoder" in n:
                 p.requires_grad = True
-                print("sensor motion encoder trainable")
+                print("sensor temporal encoder trainable")
 
 
         self.stage2_only = True
@@ -103,10 +101,8 @@ class MethodLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
   
-        videos, sensors, labels, sample_ids, flows = batch
-        idx, sample_id = sample_ids
-
-        current_batch_size = videos.size(0)
+        videos, sensors, _, sample_ids, flows = batch
+        idx, _ = sample_ids
 
         # --- Stage 1 ---
         # --- 1. Clustering ---
@@ -116,7 +112,7 @@ class MethodLightningModule(pl.LightningModule):
         else:
             imu_data_aug = sensors
 
-        scores, features, _ = self.sensor_model.encoding_appearance(imu_data_aug, labels=labels, return_features=True, idx=idx)
+        scores, features, _ = self.sensor_model.encoding_spatial(imu_data_aug, labels=None, return_features=True, idx=idx)
         
         stored_pseudo_labels = self.clustering_module.get_pseudo_labels(idx)
 
@@ -137,7 +133,7 @@ class MethodLightningModule(pl.LightningModule):
 
                     manager = self.clustering_module.clustering_manager
                     if not hasattr(manager, "cluster_stats") or len(manager.cluster_stats) == 0:
-                        manager.compute_class_weights()  # 이 시점에서 cluster_stats 생성됨
+                        manager.compute_class_weights()  
                     if self.hparams.centroid_threshold == 0.75:
                         threshold = manager.cluster_stats[k]["q75"]
                     elif self.hparams.centroid_threshold == 0.50:
@@ -186,17 +182,17 @@ class MethodLightningModule(pl.LightningModule):
         
        # --- Decompose ---
         model_output = self.video_model(videos, flows=flows)
-        v_appearance = model_output['v_appearance']
+        v_spatial = model_output["v_spatial"]
 
-        sensor_output = self.sensor_model.sensor_appearance_encoder(sensors)
-        sensor_emb = sensor_output['emb']
+        sensor_output = self.sensor_model.sensor_spatial_encoder(sensors)
+        sensor_emb = sensor_output["emb"]
 
         # --- Cross-Modal Pseudo Label Refinement ---
         loss_video_supervised = torch.tensor(0.0, device=self.device)
         loss_sensor_guided = torch.tensor(0.0, device=self.device)
 
         if good_mask.any(): 
-            video_logits_good = self.video_classifier(v_appearance[good_mask])
+            video_logits_good = self.video_classifier(v_spatial[good_mask])
             loss_video_supervised = F.cross_entropy(
                 video_logits_good,
                 loss_labels[good_mask]
@@ -204,7 +200,7 @@ class MethodLightningModule(pl.LightningModule):
 
         if bad_mask.any() and self.epoch >= self.hparams.threshold_epoch + self.hparams.video_classifier_epoch:
             with torch.no_grad():
-                video_logits_bad = self.video_classifier(v_appearance[bad_mask])
+                video_logits_bad = self.video_classifier(v_spatial[bad_mask])
                 video_probs_bad = F.softmax(video_logits_bad, dim=1)
                 video_max_probs, video_pseudo_bad = torch.max(video_probs_bad, dim=1)
                 high_confidence_mask = video_max_probs >= self.hparams.threshold_classifier_confidence
@@ -234,15 +230,6 @@ class MethodLightningModule(pl.LightningModule):
         )
         if self.epoch > stage2_start: 
 
-            v_motion = model_output["v_motion"]
-            v_app = model_output["v_appearance"]
-
-            
-            v_app_norm = F.normalize(v_app.detach(), dim=1)
-            features_norm = F.normalize(features.detach(), dim=1)
-
-            sensor_motion_emb = self.sensor_model.encoding_motion(sensors)["emb"]
-
             z_video_online = model_output["z_video_online"]
             z_sensor_online = self.sensor_model(imu_data_aug)
 
@@ -250,14 +237,14 @@ class MethodLightningModule(pl.LightningModule):
             # z_sensor_online = F.normalize(z_sensor_online, dim=1)
   
             with torch.no_grad():
-                v_motion_mom = self.momentum_video_model(videos, flows)["v_motion"]
-                sensor_motion_mom = self.momentum_sensor_model.encoding_motion(sensors)["emb"]
+                v_temporal_mom = self.momentum_video_model(videos, flows)["v_temporal"]
+                sensor_temporal_mom = self.momentum_sensor_model.encoding_temporal(sensors)["emb"]
 
             gathered_z_video = F.normalize(gather(z_video_online), dim=1)
             gathered_z_sensor = F.normalize(gather(z_sensor_online), dim=1)
-            gathered_v_mom = F.normalize(gather(v_motion_mom), dim=1)
-            gathered_s_mom = F.normalize(gather(sensor_motion_mom), dim=1)
-            gathered_v_app = F.normalize(gather(v_appearance.detach()), dim=1)
+            gathered_v_mom = F.normalize(gather(v_temporal_mom), dim=1)
+            gathered_s_mom = F.normalize(gather(sensor_temporal_mom), dim=1)
+            gathered_v_app = F.normalize(gather(v_spatial.detach()), dim=1)
             gathered_features = F.normalize(gather(features.detach()), dim=1)
 
             # cal W_spatial
@@ -278,8 +265,8 @@ class MethodLightningModule(pl.LightningModule):
 
          
             
-            motion_damp_factor = F.relu(sim_stable)
-            W_conditional_damp = 1.0 - sim_app_max * motion_damp_factor
+            temporal_damp_factor = F.relu(sim_stable)
+            W_conditional_damp = 1.0 - sim_app_max * temporal_damp_factor
             
             W_final = W_app * W_conditional_damp
 

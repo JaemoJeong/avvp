@@ -1,6 +1,6 @@
     """
-    Linear Probe LSTM용 Dataset.
-    JSON 구조:
+    Linear Probe json form.
+    JSON:
     {
         "data": [
             {

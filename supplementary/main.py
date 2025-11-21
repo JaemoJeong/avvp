@@ -151,22 +151,21 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Method Test with PyTorch Lightning")
+
     # path hyperparameters
     parser.add_argument("--dataset_name", type=str, default="Opportunity++", help="Dataset name")
     parser.add_argument("--model_name", type=str, default="method")
-    parser.add_argument("--visualize_output_dir", type=str, default="/home/junho/Method/Visualization/transformed_video", help="Directory to save visualization outputs")
     parser.add_argument("--project_name", type=str, default="Method_Test_Lightning", help="WandB project name")
     parser.add_argument("--save_stage_cache", type=bool, default=False, help="Whether use stage cache")
     parser.add_argument("--save_weights", type=bool, default=False, help="Whether save weights")
 
     # learning hyperparameters   
-    parser.add_argument("--epochs", type=int, default=26)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_frames", type=int, default=20)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--embedding_dim", type=int, default=512) # Total
-    parser.add_argument("--alpha_fixed", type=bool, default=True)
     parser.add_argument("--threshold_epoch", type=int, default=5)
     parser.add_argument("--centroid_threshold", type=float, default=0.75)
     parser.add_argument("--video_classifier_epoch", type=int, default=10)
@@ -174,12 +173,9 @@ if __name__ == '__main__':
 
     parser.add_argument("--momentum_m", type=float, default=0.999)
     parser.add_argument("--lambda_hard", type=float, default=3.0)
-    parser.add_argument("--motion_damp_temp", type=float, default=0.1)
+    parser.add_argument("--motion_damp_temp", type=float, default=0.10)
     parser.add_argument("--contrastive_temp", type=float, default=0.10)
     parser.add_argument("--ablation_study", type=str, default=None)
-
-    parser.add_argument("--damp_warmup_epochs", type=int, default=5)
-
     
     args = parser.parse_args()
     args.stage = "pretrain"

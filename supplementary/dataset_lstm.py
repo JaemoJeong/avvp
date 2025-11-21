@@ -39,21 +39,6 @@ class SeqItem:
 
 
 class SequenceDataset(Dataset):
-    """
-    Linear Probe LSTM용 Dataset.
-    JSON 구조:
-    {
-        "data": [
-            {
-                "sequence_id": "tidy_s14",
-                "windows": [
-                    {"sensor_path": "trim_2s_sensor/tidy/...csv", "class_name": "tidy", ...},
-                    ...
-                ]
-            }
-        ]
-    }
-    """
     def __init__(self, json_path: str, data_root: str, class_to_idx: Dict[str, int],
                  dtype: torch.dtype = torch.float32, sensor_transform: SensorTransform = None):
         super().__init__()
