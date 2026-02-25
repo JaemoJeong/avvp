@@ -3,5 +3,4 @@ python main.py \
   --audio_dir /mnt/hdd4tb/jaemo/data/LLP/raw_audio_test \
   --backbone language_bind \
   --dataset LLP \
-  --threshold 0.5 \
   --gpu_id 1

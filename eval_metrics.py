@@ -336,9 +336,9 @@ def calculate_metrices_LLP(video_dir_path, pred, categories, split="test", get_p
     pred_audio = {list(d.keys())[0]: list(d.values())[0] for d in pred["audio"]}
 
 
-    df = pd.read_csv(f"data/AVVP/AVVP_{split}_pd.csv", header=0, sep='\t')
-    df_a = pd.read_csv("data/AVVP/AVVP_eval_audio.csv", header=0, sep='\t')
-    df_v = pd.read_csv("data/AVVP/AVVP_eval_visual.csv", header=0, sep='\t')
+    df = pd.read_csv(f"/mnt/hdd4tb/jaemo/data/LLP/AVVP_{split}_pd.csv", header=0, sep='\t')
+    df_a = pd.read_csv("/mnt/hdd4tb/jaemo/data/LLP/AVVP_eval_audio.csv", header=0, sep='\t')
+    df_v = pd.read_csv("/mnt/hdd4tb/jaemo/data/LLP/AVVP_eval_visual.csv", header=0, sep='\t')
 
     # Filter to only predicted video_ids (for 1/4 dataset compatibility)
     predicted_video_ids = set(pred_combined.keys())

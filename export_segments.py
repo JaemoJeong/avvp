@@ -153,10 +153,11 @@ def export_segments_to_txt(predictions, video_dir_path, similarity_data, thresho
                 video_sim_original_raw = to_cpu(similarity_data[video_id].get('image_original_raw', None))
                 video_sim_vcd_raw = to_cpu(similarity_data[video_id].get('image_vcd_raw', None))
                 audio_sim_raw = to_cpu(similarity_data[video_id].get('audio_raw', None))
-                
                 has_vcd = (video_sim_vcd is not None)
                 
                 audio_sim = to_cpu(similarity_data[video_id].get('audio', None))
+                audio_sim_raw = to_cpu(similarity_data[video_id].get('audio_raw', None))
+                video_sim_raw = to_cpu(similarity_data[video_id].get('image_raw', None))
                 # combined_sim = similarity_data[video_id].get('combined', None)
             
             # Write header for this video
@@ -178,19 +179,45 @@ def export_segments_to_txt(predictions, video_dir_path, similarity_data, thresho
                 f.write(f"  SEGMENT {seg_idx}\n")
                 f.write("  " + "-" * 140 + "\n")
                 
-                # Find categories with GT or prediction in this segment
-                active_categories = []
-                for cat_idx, category in enumerate(categories):
+                # Determine ordered categories to display: Visual Top 4 -> Audio Top 4 -> Remaining active
+                v_top4_idx = []
+                a_top4_idx = []
+                
+                if video_sim is not None:
+                    try:
+                        if len(video_sim.shape) == 2 and video_sim.shape[1] == 25:
+                            v_scores = video_sim[seg_idx].numpy() if hasattr(video_sim[seg_idx], 'numpy') else video_sim[seg_idx]
+                            v_top4_idx = np.argsort(v_scores)[-4:][::-1].tolist()
+                    except: pass
+                
+                if audio_sim is not None:
+                    try:
+                        if len(audio_sim.shape) == 2 and audio_sim.shape[1] == 25:
+                            a_scores = audio_sim[seg_idx].numpy() if hasattr(audio_sim[seg_idx], 'numpy') else audio_sim[seg_idx]
+                            a_top4_idx = np.argsort(a_scores)[-4:][::-1].tolist()
+                    except: pass
+                
+                ordered_indices = []
+                for idx in v_top4_idx:
+                    if idx not in ordered_indices: ordered_indices.append(int(idx))
+                for idx in a_top4_idx:
+                    if idx not in ordered_indices: ordered_indices.append(int(idx))
+                
+                # Make sure any GT or Prediction that is NOT in the top 4 is still displayed
+                for cat_idx in range(25):
                     if (GT_a[cat_idx, seg_idx] > 0 or GT_v[cat_idx, seg_idx] > 0 or 
                         SO_a[cat_idx, seg_idx] > 0 or SO_v[cat_idx, seg_idx] > 0 or SO_av[cat_idx, seg_idx] > 0):
-                        active_categories.append((cat_idx, category))
+                        if cat_idx not in ordered_indices:
+                            ordered_indices.append(cat_idx)
+                            
+                active_categories = [(idx, categories[idx]) for idx in ordered_indices]
                 
                 if active_categories:
                     # Header for categories
                     if has_vcd:
                         f.write(f"  {'Category':<25} | {'GT_A':^5} {'GT_V':^5} {'GT_AV':^5} | {'Pred_A':^5} {'Pred_V':^5} {'Pred_AV':^5} | {'V_Orig':^6} {'V_VCD':^6} {'A_Sim':^6} | {'V_Orig':^8} {'V_VCD':^8} {'A_Sim':^8} (raw)")
                     else:
-                        f.write(f"  {'Category':<25} | {'GT_A':^5} {'GT_V':^5} {'GT_AV':^5} | {'Pred_A':^5} {'Pred_V':^5} {'Pred_AV':^5} | {'V_Sim':^6} {'A_Sim':^6}")
+                        f.write(f"  {'Category':<25} | {'GT_A':^5} {'GT_V':^5} {'GT_AV':^5} | {'Pred_A':^5} {'Pred_V':^5} {'Pred_AV':^5} | {'V_Sim':^6} {'A_Sim':^6} | {'V_Raw':^8} {'A_Raw':^8}")
                     f.write("\n")
                     f.write("  " + "-" * 150 + "\n")
                     
@@ -251,7 +278,21 @@ def export_segments_to_txt(predictions, video_dir_path, similarity_data, thresho
                             
                             f.write(f"  {category:<25} | {gt_a:^5} {gt_v:^5} {gt_av:^5} | {pred_a:^5} {pred_v:^5} {pred_av:^5} | {v_orig_str:^6} {v_vcd_str:^6} {a_sim_str:^6} | {v_orig_raw_str:^8} {v_vcd_raw_str:^8} {a_raw_str:^8}")
                         else:
-                            f.write(f"  {category:<25} | {gt_a:^5} {gt_v:^5} {gt_av:^5} | {pred_a:^5} {pred_v:^5} {pred_av:^5} | {v_sim_str:^6} {a_sim_str:^6}")
+                            v_raw_str, a_raw_str = "-", "-"
+                            if video_sim_raw is not None:
+                                try:
+                                    if len(video_sim_raw.shape) == 2 and video_sim_raw.shape[1] == 25:
+                                        val = video_sim_raw[seg_idx, cat_idx]
+                                        v_raw_str = f"{val.item():.3f}" if hasattr(val, 'item') else f"{val:.3f}"
+                                except: pass
+                            if audio_sim_raw is not None:
+                                try:
+                                    if len(audio_sim_raw.shape) == 2 and audio_sim_raw.shape[1] == 25:
+                                        val = audio_sim_raw[seg_idx, cat_idx]
+                                        a_raw_str = f"{val.item():.3f}" if hasattr(val, 'item') else f"{val:.3f}"
+                                except: pass
+                                
+                            f.write(f"  {category:<25} | {gt_a:^5} {gt_v:^5} {gt_av:^5} | {pred_a:^5} {pred_v:^5} {pred_av:^5} | {v_sim_str:^6} {a_sim_str:^6} | {v_raw_str:^8} {a_raw_str:^8}")
                         f.write("\n")
                 
                 f.write("\n")

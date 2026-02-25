@@ -22,7 +22,10 @@ class VideoDataset(Dataset):
         if subset is not None:
             self.videos_ids = [vid for vid in self.videos_ids if vid in subset]
 
-        print(f"Dataset Loaded: {len(self.videos_ids)} videos.")
+        # Use only 1/4 of the dataset for faster testing
+        portion_of_using = 1
+        self.videos_ids = self.videos_ids[:int(len(self.videos_ids)*portion_of_using)]
+        print(f"Using {len(self.videos_ids)} videos ({portion_of_using*100}% of dataset)")
 
     def __len__(self):
         return len(self.videos_ids)

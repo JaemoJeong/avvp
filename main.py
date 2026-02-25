@@ -11,15 +11,9 @@ from dataset import VideoDataset
 from models import LanguageBind_model, CLIP_CLAP_model
 from utils import set_random_seed, load_data
 from eval_metrics import calculate_metrices_LLP, print_metrices
-# from export_segments import export_segments_to_txt # If needed, but user said "segment_analysis folder... text file" so I might need to implement this simple export function here or import it.
+from export_segments import export_segments_to_txt
 
-def export_segments_to_txt(predictions, output_file):
-    with open(output_file, 'w') as f:
-        for vid, events in predictions.items():
-            f.write(f"Video: {vid}\n")
-            for event in events:
-                f.write(f"  {event['event_label']} : {event['start']} - {event['end']}\n")
-            f.write("\n")
+
 
 def merge_consecutive_segments(events):
     # events: list of [start, end]
@@ -71,9 +65,17 @@ def main():
     parser.add_argument('--audio_dir', required=True, type=str)
     parser.add_argument('--backbone', default='language_bind', type=str, choices=['language_bind', 'clip_clap'])
     parser.add_argument('--dataset', default='LLP', type=str)
-    parser.add_argument('--threshold', default=0.5, type=float)
+    parser.add_argument('--threshold', default=0.75, type=float)
     parser.add_argument('--gpu_id', default=0, type=int)
     parser.add_argument('--seed', default=42, type=int)
+    parser.add_argument('--use_tci', action='store_true', default=False,
+                        help='Enable Temporal Context Injection (HAN g_sa)')
+    parser.add_argument('--use_cross_modal', action='store_true', default=False,
+                        help='Enable audio-visual cross-modal guidance')
+    parser.add_argument('--use_filtering', action='store_true', default=False,
+                        help='Enable video-level label filtering before per-segment detection')
+    parser.add_argument('--filter_threshold', default=0.5, type=float,
+                        help='Threshold for video-level filtering (norm_similarities scale, 0-1)')
     args = parser.parse_args()
 
     set_random_seed(args.seed)
@@ -87,14 +89,15 @@ def main():
     if args.backbone == 'language_bind':
         model = LanguageBind_model(device)
     else:
-        model = CLIP_CLAP_model(device)
+        model = CLIP_CLAP_model(device, use_tci=args.use_tci, use_cross_modal=args.use_cross_modal)
 
     # Main Loop
     predictions = {
         "combined": {}, "video": {}, "audio": {}
     }
+    similarity_data = {}  # {video_id: {'image': tensor, 'audio': tensor}}
     
-    print(f"Starting inference with {args.backbone}, Threshold: {args.threshold}")
+    print(f"Starting inference with {args.backbone}, Threshold: {args.threshold}, TCI: {args.use_tci}, Filtering: {args.use_filtering} (thr={args.filter_threshold})")
     
     for i in tqdm(range(len(dataset))):
         decord_vr, waveform_and_sr, video_id = dataset[i]
@@ -111,9 +114,18 @@ def main():
         vision_trans = VisionTransform(args.backbone) # default 8 frames
         audio_trans = AudioTransform(args.backbone)
         
-        # 1. Transform Audio (10 chunks for per-second granularity)
-        # The `split_sample_audio` from `AudioTransform` handles 10s split.
+        # 1. Transform Audio
+        # For per-second granularity (10 chunks)
         audio_chunks = audio_trans.split_sample_audio(waveform_and_sr, sample_audio_sec=1) 
+        
+        # For global filtering (full 10s)
+        audio_full = None
+        if args.use_filtering:
+            audio_full = audio_trans(waveform_and_sr)
+            if isinstance(audio_full, torch.Tensor):
+                audio_full = audio_full.to(device)
+                if len(audio_full.shape) == 5:
+                    audio_full = audio_full.squeeze(1)
         # shape: (10, 1, 3, 112, 1036) for LB or (10, ...) list for CLAP?
         
         if args.backbone == 'clip_clap' and isinstance(audio_chunks, list):
@@ -143,57 +155,137 @@ def main():
                      video_id=video_id,
                      similarity_type='audio-image', 
                      vision_mode='image', # output (10, 25) for image
-                     start_time=0, end_time=10)
+                     start_time=0, end_time=10,
+                     audio_transformed_full=audio_full)
         
-        # sims['image'] : (10, 25)
-        # sims['audio'] : (10, 25) -> My model wrapper handles 10 chunks
+        # sims['image'] : (10, K)
+        # sims['audio'] : (10, K)
         
-        # 4. Late Fusion (AND logic)
-        # Original: "late fusion" code 
-        # pred_av = np.logical_and(pred_audio, pred_video)
+        # ── Label Filtering (Independent) ──
+        vid_active_labels = labels
+        aud_active_labels = labels
         
-        # Thresholding
+        if args.use_filtering:
+            vid_sims_global = sims['image'].mean(dim=0)  # (K,)
+            
+            if 'global_audio' in sims:
+                aud_sims_global = sims['global_audio'].squeeze(0) # (K,)
+            else:
+                aud_sims_global = sims['audio'].mean(dim=0)  # (K,)
+            
+            vid_pass = [i for i, s in enumerate(vid_sims_global) if s > args.filter_threshold]
+            aud_pass = [i for i, s in enumerate(aud_sims_global) if s > args.filter_threshold]
+            
+            vid_filtered_labels = [labels[i] for i in vid_pass]
+            aud_filtered_labels = [labels[i] for i in aud_pass]
+            
+            print(f"[FILTER] {video_id}: V {len(labels)}→{len(vid_filtered_labels)}, A {len(labels)}→{len(aud_filtered_labels)}")
+            if vid_filtered_labels:
+                print(f"[FILTER] V-Kept: {vid_filtered_labels}")
+            if aud_filtered_labels:
+                print(f"[FILTER] A-Kept: {aud_filtered_labels}")
+            
+            # Re-compute specifically for each modality if filtered
+            if 0 < len(vid_filtered_labels) < len(labels):
+                vid_active_labels = vid_filtered_labels
+                sims_vid = model(vid_active_labels,
+                                 vision_transformed=video_frames,
+                                 audio_transformed=None, # only compute vision
+                                 video_id=video_id,
+                                 similarity_type='image',
+                                 vision_mode='image',
+                                 start_time=0, end_time=10)
+                sims['image'] = sims_vid['image']
+                if 'image_raw' in sims_vid:
+                    sims['image_raw'] = sims_vid['image_raw']
+            elif len(vid_filtered_labels) == 0:
+                print(f"[FILTER] WARNING: All V-labels filtered out for {video_id}.")
+                vid_active_labels = labels  # fallback
+                
+            if 0 < len(aud_filtered_labels) < len(labels):
+                aud_active_labels = aud_filtered_labels
+                sims_aud = model(aud_active_labels,
+                                 vision_transformed=None, # only compute audio
+                                 audio_transformed=audio_chunks,
+                                 video_id=video_id,
+                                 similarity_type='audio',
+                                 start_time=0, end_time=10,
+                                 audio_transformed_full=audio_full)
+                sims['audio'] = sims_aud['audio']
+                if 'audio_raw' in sims_aud:
+                    sims['audio_raw'] = sims_aud['audio_raw']
+            elif len(aud_filtered_labels) == 0:
+                print(f"[FILTER] WARNING: All A-labels filtered out for {video_id}.")
+                aud_active_labels = labels  # fallback
+        
+        # ── Thresholding & Event Detection ──
         vid_events_bin = get_binary_events(sims['image'], args.threshold)
         aud_events_bin = get_binary_events(sims['audio'], args.threshold)
         
-        # Format for fusion: map to mask
-        def events_to_mask(evt_list, num_classes=25, length=10):
+        def events_to_mask(evt_list, num_classes, length=10):
             mask = np.zeros((length, num_classes), dtype=int)
             for e in evt_list:
                 mask[e['start']:e['end'], e['class_idx']] = 1
             return mask
             
-        vid_mask = events_to_mask(vid_events_bin, len(labels))
-        aud_mask = events_to_mask(aud_events_bin, len(labels))
+        vid_mask_active = events_to_mask(vid_events_bin, len(vid_active_labels))
+        aud_mask_active = events_to_mask(aud_events_bin, len(aud_active_labels))
         
-        fusion_mask = np.logical_and(vid_mask, aud_mask).astype(int)
+        # Project masks to full 25-class space for Fusion & Export
+        vid_mask_full = np.zeros((10, len(labels)), dtype=int)
+        aud_mask_full = np.zeros((10, len(labels)), dtype=int)
         
-        # Convert back to list of dicts
-        final_events = []
-        for cls_idx in range(len(labels)):
-            seq = fusion_mask[:, cls_idx]
-            diff = np.diff(np.concatenate(([0], seq, [0])))
-            starts = np.flatnonzero(diff == 1)
-            ends = np.flatnonzero(diff == -1)
+        for i, lbl in enumerate(vid_active_labels):
+            idx = labels.index(lbl)
+            vid_mask_full[:, idx] = vid_mask_active[:, i]
             
-            # Merge consecutive logic included naturally by mask? 
-            # Yes, if 1,1,1 -> start=0, end=3.
-            # But `merge_consecutive_segments` in original handled gap? 
-            # Original: "if current[0] <= last[1] + 1". 
-            # Our mask logic naturally merges touching ones.
-            # If we want to merge ones separated by 1 frame gap, we need smoothing.
-            # "merge_consecutive_segments" from prompt: "needed for formatting" basically.
-            # I will trust the mask logic is sufficient for "AND" fusion.
-            
-            for s, e in zip(starts, ends):
-                 final_events.append({
-                     "event_label": labels[cls_idx],
-                     "start": int(s),
-                     "end": int(e)
-                 })
-                 
+        for i, lbl in enumerate(aud_active_labels):
+            idx = labels.index(lbl)
+            aud_mask_full[:, idx] = aud_mask_active[:, i]
+        
+        fusion_mask_full = np.logical_and(vid_mask_full, aud_mask_full).astype(int)
+        
+        # Helper: convert mask → event list using full labels
+        def mask_to_events(mask, label_list):
+            events = []
+            for cls_idx in range(len(label_list)):
+                seq = mask[:, cls_idx]
+                diff = np.diff(np.concatenate(([0], seq, [0])))
+                starts = np.flatnonzero(diff == 1)
+                ends = np.flatnonzero(diff == -1)
+                for s, e in zip(starts, ends):
+                    events.append({"event_label": label_list[cls_idx], "start": int(s), "end": int(e)})
+            return events
+        
+        final_events = mask_to_events(fusion_mask_full, labels)
+        vid_events = mask_to_events(vid_mask_full, labels)
+        aud_events = mask_to_events(aud_mask_full, labels)
+
         predictions["combined"][video_id] = final_events
-        # Also store individual for debug/completeness if needed, but not strictly required
+        predictions["video"][video_id] = vid_events
+        predictions["audio"][video_id] = aud_events
+        
+        # Map filtered similarities back to the full 25 labels for segment analysis export
+        # Map filtered similarities back to the full 25 labels for segment analysis export
+        full_sims = {
+            'image': torch.zeros((10, len(labels))),
+            'audio': torch.zeros((10, len(labels))),
+            'image_raw': torch.zeros((10, len(labels))),
+            'audio_raw': torch.zeros((10, len(labels)))
+        }
+        for i, lbl in enumerate(vid_active_labels):
+            idx = labels.index(lbl)
+            full_sims['image'][:, idx] = sims['image'][:, i].cpu()
+            if 'image_raw' in sims:
+                full_sims['image_raw'][:, idx] = sims['image_raw'][:, i].cpu()
+                
+        for i, lbl in enumerate(aud_active_labels):
+            idx = labels.index(lbl)
+            full_sims['audio'][:, idx] = sims['audio'][:, i].cpu()
+            if 'audio_raw' in sims:
+                full_sims['audio_raw'][:, idx] = sims['audio_raw'][:, i].cpu()
+                
+        similarity_data[video_id] = full_sims  # Store per-video similarities
         
     # Save Results
     res_dir = "results"
@@ -206,17 +298,19 @@ def main():
     
     formatted_preds = {
         "combined": [{k: v} for k, v in predictions["combined"].items()],
-        "video": [], # Empty if not evaluating components
-        "audio": []
+        "video": [{k: v} for k, v in predictions["video"].items()],
+        "audio": [{k: v} for k, v in predictions["audio"].items()]
     }
     
     with open(out_file, 'w') as f:
         json.dump(formatted_preds, f, indent=4)
         
-    # Export Text Analysis
     seg_dir = "segment_analysis"
     os.makedirs(seg_dir, exist_ok=True)
-    export_segments_to_txt(predictions["combined"], os.path.join(seg_dir, f"segment_details_{args.backbone}.txt"))
+    export_segments_to_txt(
+        formatted_preds, args.video_dir, similarity_data,
+        output_file=os.path.join(seg_dir, args.backbone,"segment_details.txt")
+    )
     
     # Evaluation
     print("Running Evaluation...")
