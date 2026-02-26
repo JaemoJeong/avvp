@@ -3,4 +3,5 @@ python main.py \
   --audio_dir /mnt/hdd4tb/jaemo/data/LLP/raw_audio_test \
   --backbone clip_clap \
   --dataset LLP \
+  --use_filtering \
   --gpu_id 1

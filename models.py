@@ -68,8 +68,12 @@ class LanguageBind_model:
                 # We will just pass start_time, end_time to cache.
                 audio_feat = self.cache.get_or_compute(video_id, 'audio', compute_audio, start_time, end_time).to(self.device)
             
+            # LanguageBind relies on unnormalized dot products for its calibrated similarities.
+            raw_audio_logits = audio_feat @ text_emb.T
+            similarities['audio_raw'] = raw_audio_logits.clone()
+            print(f"[RAW] LB audio logits: min={raw_audio_logits.min():.3f}, max={raw_audio_logits.max():.3f}, mean={raw_audio_logits.mean():.3f}")
             
-            similarities['audio'] = norm_similarities(audio_feat @ text_emb.T)
+            similarities['audio'] = norm_similarities(raw_audio_logits)
 
             # Global Audio Embeddings (if full 10s audio provided)
             if audio_transformed_full is not None:
@@ -79,7 +83,9 @@ class LanguageBind_model:
                     def compute_global_audio():
                         return self.model(languagebind_inputs_global)['audio']
                     global_audio_feat = self.cache.get_or_compute(video_id, 'global_audio', compute_global_audio, start_time, end_time).to(self.device)
-                similarities['global_audio'] = norm_similarities(global_audio_feat @ text_emb.T)
+                
+                raw_global_audio_logits = global_audio_feat @ text_emb.T
+                similarities['global_audio'] = norm_similarities(raw_global_audio_logits)
         # Vision Embeddings
         if ('image' in similarity_type or 'video' in similarity_type) and vision_transformed is not None:
             # Determine processing key based on request or default
@@ -94,7 +100,11 @@ class LanguageBind_model:
                 # Careful with caching key logic.
                 vision_feat = self.cache.get_or_compute(video_id, sim_key, compute_vision, start_time, end_time).to(self.device)
 
-            similarities[sim_key] = norm_similarities(vision_feat @ text_emb.T)
+            raw_vision_logits = vision_feat @ text_emb.T
+            similarities[f'{sim_key}_raw'] = raw_vision_logits.clone()
+            print(f"[RAW] LB vision logits: min={raw_vision_logits.min():.3f}, max={raw_vision_logits.max():.3f}, mean={raw_vision_logits.mean():.3f}")
+            
+            similarities[sim_key] = norm_similarities(raw_vision_logits)
             
             if sim_key == 'image':
                 similarities['image_features'] = vision_feat

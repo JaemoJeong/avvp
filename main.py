@@ -55,7 +55,9 @@ def get_binary_events(similarities, thresholds_val):
         # Let's say start=0, end=1 means 1st second.
         
         for s, e in zip(starts, ends):
-            events.append({"class_idx": cls_idx, "start": int(s), "end": int(e)})
+            # 1-second removal logic (AV2A_jaemo style)
+            if e - s > 1:
+                events.append({"class_idx": cls_idx, "start": int(s), "end": int(e)})
             
     return events
 
@@ -161,9 +163,8 @@ def main():
         # sims['image'] : (10, K)
         # sims['audio'] : (10, K)
         
-        # ── Label Filtering (Independent) ──
-        vid_active_labels = labels
-        aud_active_labels = labels
+        # ── Label Filtering (Intersection: must pass BOTH A and V) ──
+        active_labels = labels
         
         if args.use_filtering:
             vid_sims_global = sims['image'].mean(dim=0)  # (K,)
@@ -173,50 +174,29 @@ def main():
             else:
                 aud_sims_global = sims['audio'].mean(dim=0)  # (K,)
             
-            vid_pass = [i for i, s in enumerate(vid_sims_global) if s > args.filter_threshold]
-            aud_pass = [i for i, s in enumerate(aud_sims_global) if s > args.filter_threshold]
+            vid_pass = set(i for i, s in enumerate(vid_sims_global) if s > args.filter_threshold)
+            aud_pass = set(i for i, s in enumerate(aud_sims_global) if s > args.filter_threshold)
+            keep_indices = sorted(vid_pass & aud_pass)  # Intersection: both must pass
             
-            vid_filtered_labels = [labels[i] for i in vid_pass]
-            aud_filtered_labels = [labels[i] for i in aud_pass]
+            filtered_labels = [labels[i] for i in keep_indices]
+            print(f"[FILTER] {video_id}: {len(labels)} → {len(filtered_labels)} labels "
+                  f"(V:{len(vid_pass)}, A:{len(aud_pass)}, Intersect:{len(keep_indices)})")
+            if filtered_labels:
+                print(f"[FILTER] Kept: {filtered_labels}")
             
-            print(f"[FILTER] {video_id}: V {len(labels)}→{len(vid_filtered_labels)}, A {len(labels)}→{len(aud_filtered_labels)}")
-            if vid_filtered_labels:
-                print(f"[FILTER] V-Kept: {vid_filtered_labels}")
-            if aud_filtered_labels:
-                print(f"[FILTER] A-Kept: {aud_filtered_labels}")
-            
-            # Re-compute specifically for each modality if filtered
-            if 0 < len(vid_filtered_labels) < len(labels):
-                vid_active_labels = vid_filtered_labels
-                sims_vid = model(vid_active_labels,
-                                 vision_transformed=video_frames,
-                                 audio_transformed=None, # only compute vision
-                                 video_id=video_id,
-                                 similarity_type='image',
-                                 vision_mode='image',
-                                 start_time=0, end_time=10)
-                sims['image'] = sims_vid['image']
-                if 'image_raw' in sims_vid:
-                    sims['image_raw'] = sims_vid['image_raw']
-            elif len(vid_filtered_labels) == 0:
-                print(f"[FILTER] WARNING: All V-labels filtered out for {video_id}.")
-                vid_active_labels = labels  # fallback
-                
-            if 0 < len(aud_filtered_labels) < len(labels):
-                aud_active_labels = aud_filtered_labels
-                sims_aud = model(aud_active_labels,
-                                 vision_transformed=None, # only compute audio
-                                 audio_transformed=audio_chunks,
-                                 video_id=video_id,
-                                 similarity_type='audio',
-                                 start_time=0, end_time=10,
-                                 audio_transformed_full=audio_full)
-                sims['audio'] = sims_aud['audio']
-                if 'audio_raw' in sims_aud:
-                    sims['audio_raw'] = sims_aud['audio_raw']
-            elif len(aud_filtered_labels) == 0:
-                print(f"[FILTER] WARNING: All A-labels filtered out for {video_id}.")
-                aud_active_labels = labels  # fallback
+            if len(filtered_labels) > 0 and len(filtered_labels) < len(labels):
+                active_labels = filtered_labels
+                sims = model(active_labels,
+                             vision_transformed=video_frames,
+                             audio_transformed=audio_chunks,
+                             video_id=video_id,
+                             similarity_type='audio-image',
+                             vision_mode='image',
+                             start_time=0, end_time=10,
+                             audio_transformed_full=audio_full)
+            elif len(filtered_labels) == 0:
+                print(f"[FILTER] WARNING: All labels filtered out for {video_id}, keeping all.")
+                active_labels = labels
         
         # ── Thresholding & Event Detection ──
         vid_events_bin = get_binary_events(sims['image'], args.threshold)
@@ -228,19 +208,16 @@ def main():
                 mask[e['start']:e['end'], e['class_idx']] = 1
             return mask
             
-        vid_mask_active = events_to_mask(vid_events_bin, len(vid_active_labels))
-        aud_mask_active = events_to_mask(aud_events_bin, len(aud_active_labels))
+        vid_mask_active = events_to_mask(vid_events_bin, len(active_labels))
+        aud_mask_active = events_to_mask(aud_events_bin, len(active_labels))
         
         # Project masks to full 25-class space for Fusion & Export
         vid_mask_full = np.zeros((10, len(labels)), dtype=int)
         aud_mask_full = np.zeros((10, len(labels)), dtype=int)
         
-        for i, lbl in enumerate(vid_active_labels):
+        for i, lbl in enumerate(active_labels):
             idx = labels.index(lbl)
             vid_mask_full[:, idx] = vid_mask_active[:, i]
-            
-        for i, lbl in enumerate(aud_active_labels):
-            idx = labels.index(lbl)
             aud_mask_full[:, idx] = aud_mask_active[:, i]
         
         fusion_mask_full = np.logical_and(vid_mask_full, aud_mask_full).astype(int)
@@ -266,22 +243,19 @@ def main():
         predictions["audio"][video_id] = aud_events
         
         # Map filtered similarities back to the full 25 labels for segment analysis export
-        # Map filtered similarities back to the full 25 labels for segment analysis export
         full_sims = {
             'image': torch.zeros((10, len(labels))),
             'audio': torch.zeros((10, len(labels))),
             'image_raw': torch.zeros((10, len(labels))),
             'audio_raw': torch.zeros((10, len(labels)))
         }
-        for i, lbl in enumerate(vid_active_labels):
+        for i, lbl in enumerate(active_labels):
             idx = labels.index(lbl)
             full_sims['image'][:, idx] = sims['image'][:, i].cpu()
+            full_sims['audio'][:, idx] = sims['audio'][:, i].cpu()
+            
             if 'image_raw' in sims:
                 full_sims['image_raw'][:, idx] = sims['image_raw'][:, i].cpu()
-                
-        for i, lbl in enumerate(aud_active_labels):
-            idx = labels.index(lbl)
-            full_sims['audio'][:, idx] = sims['audio'][:, i].cpu()
             if 'audio_raw' in sims:
                 full_sims['audio_raw'][:, idx] = sims['audio_raw'][:, i].cpu()
                 
